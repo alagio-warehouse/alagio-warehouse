@@ -12,6 +12,13 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '507326616';
 const SHOPIFY_SECRET = process.env.SHOPIFY_SECRET || 'ВАШ_SHOPIFY_WEBHOOK_SECRET';
 
 // ── Middleware ──
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
 app.use(express.static('public'));
 app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
