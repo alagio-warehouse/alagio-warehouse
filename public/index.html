@@ -911,7 +911,7 @@ let scannedItems = [];
 let imageDataUrl = null;
 
 // ========== TABS ==========
-function showTab(name) {
+window.showTab = function showTab(name) {
   document.querySelectorAll('.main').forEach(el => el.classList.remove('active'));
   document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
   document.getElementById('tab-' + name).classList.add('active');
@@ -927,7 +927,7 @@ function showTab(name) {
 }
 
 // ========== UPLOAD ==========
-function handleFiles(files) {
+window.handleFiles = function handleFiles(files) {
   if (!files.length) return;
   const file = files[0];
   const reader = new FileReader();
@@ -954,7 +954,7 @@ uz.addEventListener('drop', e => {
 });
 
 // ========== AI ANALYSIS ==========
-async function analyzeImage() {
+window.analyzeImage = async function analyzeImage() {
   if (!imageDataUrl) return;
 
   const apiKey = document.getElementById('apiKeyInput').value;
@@ -1085,7 +1085,7 @@ function autoAssignLocation() {
 }
 
 // ========== SAVE ITEMS ==========
-function saveAllItems() {
+window.saveAllItems = function saveAllItems() {
   if (!scannedItems.length) return;
   scannedItems.forEach(item => {
     inventory.push({
@@ -1107,7 +1107,7 @@ function saveAllItems() {
   showTab('inventory');
 }
 
-function resetScan() {
+window.resetScan = function resetScan() {
   document.getElementById('analysisSection').style.display = 'none';
   document.getElementById('fileInput').value = '';
   scannedItems = [];
@@ -1167,7 +1167,7 @@ function renderInventory() {
 }
 
 // ========== INVENTARIZATION MODAL ==========
-function openInvModal(id) {
+window.openInvModal = function openInvModal(id) {
   const item = inventory.find(i=>String(i.id)===String(id));
   if (!item) return;
   document.getElementById('invModalTitle').textContent = `${item.name} EU${item.size} · ${item.color}`;
@@ -1179,7 +1179,7 @@ function openInvModal(id) {
   openModal('invModal');
 }
 
-function saveInvModal() {
+window.saveInvModal = function saveInvModal() {
   const id = document.getElementById('invModalId').value;
   const newQty = parseInt(document.getElementById('invModalQty').value);
   const reason = document.getElementById('invModalReason').value.trim();
@@ -1196,7 +1196,7 @@ function saveInvModal() {
   toast(`✅ ${item.name} EU${item.size}: ${old} → ${newQty} (${reason})`);
 }
 
-function filterInventory() { renderInventory(); }
+window.filterInventory = function filterInventory() { renderInventory(); }
 
 // ========== EXPORT HELPERS ==========
 function getStockRows() {
@@ -1217,7 +1217,7 @@ function getStockRows() {
 }
 
 // ========== EXCEL EXPORT (SheetJS) ==========
-function exportExcel() {
+window.exportExcel = function exportExcel() {
   // Динамически загружаем SheetJS если ещё не загружен
   if (typeof XLSX === 'undefined') {
     const script = document.createElement('script');
@@ -1285,7 +1285,7 @@ function _doExportExcel() {
 }
 
 // ========== PDF EXPORT ==========
-function exportPDF() {
+window.exportPDF = function exportPDF() {
   const sizes = ['35','36','37','38','39','40','41','42'];
   const rows = getStockRows();
   const date = new Date().toLocaleDateString('ru-RU');
@@ -1412,14 +1412,14 @@ function renderStock() {
   }).join('');
 }
 
-function setFilter(f, el) {
+window.setFilter = function setFilter(f, el) {
   currentFilter = f;
   document.querySelectorAll('#filterChips .chip').forEach(c=>c.classList.remove('active'));
   el.classList.add('active');
   renderInventory();
 }
 
-function changeQty(id, delta) {
+window.changeQty = function changeQty(id, delta) {
   const item = inventory.find(i=>String(i.id)===String(id));
   if (!item) return;
   item.qty = Math.max(0, item.qty + delta);
@@ -1428,7 +1428,7 @@ function changeQty(id, delta) {
   renderInventory();
 }
 
-function removeItem(id) {
+window.removeItem = function removeItem(id) {
   inventory = inventory.filter(i=>String(i.id)!==String(id));
   saveInventory();
   updateHeader();
@@ -1437,7 +1437,7 @@ function removeItem(id) {
 }
 
 // ========== ADD MANUAL ==========
-function addItemManual() {
+window.addItemManual = function addItemManual() {
   const name = document.getElementById('fName').value.trim();
   if (!name) { toast('⚠️ Введите название'); return; }
   const loc = document.getElementById('fLocation').value.trim() || autoAssignLocation();
@@ -1563,7 +1563,7 @@ function renderMap() {
   document.getElementById('hdr-cells').textContent = totalOccupied;
 }
 
-function showCell(loc) {
+window.showCell = function showCell(loc) {
   const items = inventory.filter(i=>i.location===loc);
   document.getElementById('cellModalTitle').textContent = `Ячейка ${loc}`;
   if (!items.length) {
@@ -1644,7 +1644,7 @@ async function renderOrders() {
   }).join('');
 }
 
-async function fulfillOrder(id) {
+window.fulfillOrder = async function fulfillOrder(id) {
   const order = orders.find(o=>o.id===id);
   if (!order) return;
 
@@ -1685,12 +1685,12 @@ async function fulfillOrder(id) {
   updateHeader();
 }
 
-function postponeOrder(id) {
+window.postponeOrder = function postponeOrder(id) {
   toast(`⏸ Заказ ${id} отложен`);
 }
 
 // ========== SETTINGS ==========
-function saveSettings() {
+window.saveSettings = function saveSettings() {
   const url = document.getElementById('serverUrlInput').value.trim().replace(/\/$/, '');
   if (url) localStorage.setItem('sb_server_url', url);
   toast('✅ Настройки сохранены');
@@ -1698,7 +1698,7 @@ function saveSettings() {
   if (url) syncInventoryToServer(url);
 }
 
-async function testServer() {
+window.testServer = async function testServer() {
   const url = document.getElementById('serverUrlInput').value.trim().replace(/\/$/, '') || SERVER_URL;
   if (!url) { toast('⚠️ Введите URL сервера'); return; }
   try {
@@ -1733,8 +1733,8 @@ function updateHeader() {
   document.getElementById('hdr-orders').textContent = orders.filter(o=>o.status==='new').length;
 }
 
-function openModal(id) { document.getElementById(id).classList.add('show'); }
-function closeModal(id) { document.getElementById(id).classList.remove('show'); }
+window.openModal = function openModal(id) { document.getElementById(id).classList.add('show'); }
+window.closeModal = function closeModal(id) { document.getElementById(id).classList.remove('show'); }
 
 document.querySelectorAll('.modal-overlay').forEach(m => {
   m.addEventListener('click', e => { if(e.target===m) m.classList.remove('show'); });
