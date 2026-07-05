@@ -1,0 +1,1311 @@
+const express = require('express');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// ── Определяем папку для данных ──
+// Если примонтирован Railway Volume — используем /data, иначе __dirname
+const DATA_DIR = (() => {
+  try {
+    fs.accessSync('/data', fs.constants.W_OK);
+    console.log('📁 Используем /data (Railway Volume)');
+    return '/data';
+  } catch {
+    console.log('📁 Используем локальную папку');
+    return __dirname;
+  }
+})();
+
+// ── Config (заменить на реальные значения) ──
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || '';
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+const SHOPIFY_SECRET = process.env.SHOPIFY_SECRET || 'ВАШ_SHOPIFY_WEBHOOK_SECRET';
+
+// ── Middleware ──
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+app.use(express.static('public'));
+app.use(express.static(__dirname));
+app.use('/webhook', express.raw({ type: 'application/json' }));
+app.use(express.json({ limit: '20mb' }));
+
+// Явный маршрут для главной страницы
+app.get('/', (req, res) => {
+  const publicPath = path.join(__dirname, 'public', 'index.html');
+  const rootPath = path.join(__dirname, 'index.html');
+  if (fs.existsSync(publicPath)) {
+    res.sendFile(publicPath);
+  } else if (fs.existsSync(rootPath)) {
+    res.sendFile(rootPath);
+  } else {
+    res.send('<h1>AlagioStore Server</h1><p>index.html not found. Upload it to /public/ folder.</p>');
+  }
+});
+
+// ── Хранилище заказов (файл, чтобы не терять при рестарте) ──
+const ORDERS_FILE = path.join(DATA_DIR, 'orders.json');
+function loadOrders() {
+  try { return JSON.parse(fs.readFileSync(ORDERS_FILE, 'utf8')); } catch { return []; }
+}
+function saveOrders(orders) {
+  fs.writeFileSync(ORDERS_FILE, JSON.stringify(orders, null, 2));
+}
+
+// ── Хранилище прайс-листа ──
+const PRICELIST_FILE = path.join(DATA_DIR, 'pricelist.json');
+function loadPriceList() {
+  try { return JSON.parse(fs.readFileSync(PRICELIST_FILE, 'utf8')); } catch { return {}; }
+}
+function savePriceList(data) {
+  fs.writeFileSync(PRICELIST_FILE, JSON.stringify(data, null, 2));
+}
+
+// ── Хранилище инвентаря ──
+const INVENTORY_FILE = path.join(DATA_DIR, 'inventory.json');
+function loadInventory() {
+  try { return JSON.parse(fs.readFileSync(INVENTORY_FILE, 'utf8')); } catch { return []; }
+}
+function saveInventory(inv) {
+  fs.writeFileSync(INVENTORY_FILE, JSON.stringify(inv, null, 2));
+}
+
+// ── Хранилище магазина ──
+const SHOPSTOCK_FILE = path.join(DATA_DIR, 'shopstock.json');
+function saveShopStockData(data) {
+  fs.writeFileSync(SHOPSTOCK_FILE, JSON.stringify(data, null, 2));
+}
+
+function loadShopStock() {
+  try { return JSON.parse(fs.readFileSync(SHOPSTOCK_FILE, 'utf8')); } catch { return []; }
+}
+
+// ── Telegram уведомление ──
+async function sendTelegram(text) {
+  const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text,
+        parse_mode: 'HTML'
+      })
+    });
+    const data = await res.json();
+    if (!data.ok) console.error('Telegram error:', data);
+  } catch (e) {
+    console.error('Telegram send failed:', e.message);
+  }
+}
+
+// ── Верификация Shopify webhook ──
+function verifyShopify(req) {
+  if (!SHOPIFY_SECRET || SHOPIFY_SECRET === 'ВАШ_SHOPIFY_WEBHOOK_SECRET') return true; // dev mode
+  const hmac = req.headers['x-shopify-hmac-sha256'];
+  const hash = crypto
+    .createHmac('sha256', SHOPIFY_SECRET)
+    .update(req.body)
+    .digest('base64');
+  return hmac === hash;
+}
+
+// ── Найти товар по штрихкоду → склад → магазин ──
+function findByBarcode(barcode) {
+  if (!barcode) return null;
+  const bc = String(barcode).trim();
+
+  // 1. Ищем на складе по barcode
+  const inv = loadInventory();
+  const warehouseItem = inv.find(item =>
+    item.barcode && String(item.barcode).trim() === bc && item.qty > 0
+  );
+  if (warehouseItem) {
+    return { source: 'warehouse', location: warehouseItem.location, item: warehouseItem };
+  }
+
+  // 2. Ищем в barcodes.json (справочник склада)
+  const barcodes = loadBarcodes(); // { "key": "barcode" }
+  const bcKey = Object.keys(barcodes).find(k => String(barcodes[k]).trim() === bc);
+  if (bcKey) {
+    // Есть в справочнике но нет на складе — ищем в магазине
+    const shopStock = loadShopStock();
+    // bcKey формат: "Name||Size" или просто barcode lookup
+    const shopItem = shopStock.find(item =>
+      item.barcode && String(item.barcode).trim() === bc && item.shopQty > 0
+    );
+    if (shopItem) {
+      return { source: 'shop', location: 'Магазин', item: shopItem };
+    }
+    return { source: 'none', location: '❌ нет в наличии', item: null };
+  }
+
+  return null;
+}
+
+// ── Найти товар на складе (fallback по названию+размеру) ──
+function findInInventory(productName, size) {
+  const inv = loadInventory();
+  // Название с Shopify может быть длиннее: "Ogni Giorno suede sneaker" vs "Ogni Giorno"
+  // Проверяем оба направления: имя из склада входит в название Shopify, или наоборот
+  const nameShopify = productName.toLowerCase();
+  const sz = String(size);
+
+  const nameMatches = (inventoryName) => {
+    const n = inventoryName.toLowerCase();
+    return nameShopify.includes(n) || n.includes(nameShopify);
+  };
+
+  // Сначала склад
+  const warehouseItem = inv.find(item =>
+    nameMatches(item.name) &&
+    String(item.size) === sz &&
+    item.qty > 0
+  );
+  if (warehouseItem) return { source: 'warehouse', location: warehouseItem.location, item: warehouseItem };
+
+  // Потом магазин
+  const shopStock = loadShopStock();
+  const shopItem = shopStock.find(item =>
+    nameMatches(item.name) &&
+    String(item.size) === sz &&
+    item.shopQty > 0
+  );
+  if (shopItem) return { source: 'shop', location: 'Магазин', item: shopItem };
+
+  return null;
+}
+
+// ── Пересчитать location для всех заказов у которых '❓ не найдено' ──
+app.post('/api/orders/rematch', (req, res) => {
+  const orders = loadOrders();
+  let fixed = 0;
+  orders.forEach(o => {
+    if (!o.lineItems) return;
+    o.lineItems.forEach(li => {
+      if (li.location && !li.location.includes('не найдено')) return;
+      const barcode = li.barcode || null;
+      // Только по штрихкоду
+      let found = barcode ? findByBarcode(barcode) : null;
+      if (found) {
+        const sourceLabel = found.source === 'shop' ? ' (Магазин)' : found.source === 'warehouse' ? ' (Склад)' : '';
+        li.location = found.location + sourceLabel;
+        li.source = found.source;
+        fixed++;
+      }
+    });
+  });
+  saveOrders(orders);
+  res.json({ ok: true, fixed });
+});
+
+// ════════════════════════════════════════
+// WEBHOOK: Shopify → новый заказ
+// ════════════════════════════════════════
+app.post('/webhook/shopify/orders', async (req, res) => {
+  if (!verifyShopify(req)) {
+    return res.status(401).send('Unauthorized');
+  }
+
+  let order;
+  try {
+    order = JSON.parse(req.body.toString());
+  } catch {
+    return res.status(400).send('Bad JSON');
+  }
+
+  const orders = loadOrders();
+  const shopifyId = String(order.id);
+
+  // Не дублируем
+  if (orders.find(o => o.shopifyId === shopifyId)) {
+    return res.status(200).send('Duplicate');
+  }
+
+  // Получаем штрихкоды через Shopify API по variant_id (вебхук не передаёт barcode)
+  const tokenData = loadShopifyToken(); // { shop, token }
+  if (!tokenData) console.log('⚠️ Shopify токен не найден — запрос ШК по variant_id невозможен');
+
+  const getBarcodeForVariant = async (variantId) => {
+    if (!variantId || !tokenData || !tokenData.token || !tokenData.shop) return null;
+    try {
+      const r = await fetch(`https://${tokenData.shop}/admin/api/2024-04/variants/${variantId}.json`, {
+        headers: { 'X-Shopify-Access-Token': tokenData.token }
+      });
+      if (!r.ok) { console.log(`⚠️ Variant API ${r.status} для ${variantId}`); return null; }
+      const d = await r.json();
+      return d.variant?.barcode || null;
+    } catch(e) { console.log(`⚠️ Variant API ошибка: ${e.message}`); return null; }
+  };
+
+  // Формируем позиции заказа
+  const lineItemsRaw = order.line_items || [];
+  const lineItems = [];
+  for (const item of lineItemsRaw) {
+    const size = extractSize(item);
+    // Сначала пробуем штрихкод из вебхука, потом запрашиваем через API
+    let barcode = item.barcode || null;
+    if (!barcode && item.variant_id) {
+      barcode = await getBarcodeForVariant(item.variant_id);
+      if (barcode) console.log(`  🔍 Штрихкод получен через API для variant ${item.variant_id}: ${barcode}`);
+    }
+
+    console.log(`📦 Позиция заказа: "${item.title}" | size: ${size} | barcode: ${barcode} | variant_id: ${item.variant_id}`);
+
+    // Ищем ТОЛЬКО по штрихкоду
+    let found = barcode ? findByBarcode(barcode) : null;
+    if (found) console.log(`  ✅ Найдено по штрихкоду ${barcode}: ${found.location}`);
+    else console.log(`  ❌ Не найдено: barcode=${barcode}`);
+
+    const source = found ? found.source : null;
+    const location = found ? found.location : '❓ не найдено';
+    const sourceLabel = source === 'shop' ? ' (Магазин)' : source === 'warehouse' ? ' (Склад)' : '';
+
+    lineItems.push({
+      title: item.title,
+      variant: item.variant_title || '',
+      sku: item.sku || '',
+      barcode: barcode || '',
+      qty: item.quantity,
+      size,
+      source: source || 'none',
+      location: location + sourceLabel
+    });
+  }
+
+  const newOrder = {
+    id: `ORD-${Date.now()}`,
+    shopifyId,
+    shopifyOrderName: order.name || `#${shopifyId}`,
+    customer: `${order.shipping_address?.first_name || ''} ${order.shipping_address?.last_name || ''}`.trim() || order.email || 'Покупатель',
+    email: order.email || '',
+    phone: order.phone || order.shipping_address?.phone || order.billing_address?.phone || '',
+    address: formatAddress(order.shipping_address),
+    lineItems,
+    total: order.total_price ? `${order.total_price} ${order.currency}` : '',
+    status: 'new',
+    createdAt: new Date().toISOString(),
+    time: new Date().toLocaleString('ru-RU')
+  };
+
+  orders.unshift(newOrder);
+  saveOrders(orders);
+
+  // Telegram уведомление
+  const itemsText = lineItems.map(li => {
+    const srcIcon = li.source === 'warehouse' ? '🏭' : li.source === 'shop' ? '🛍️' : '❓';
+    return `  • <b>${li.title}</b>${li.size ? ` EU${li.size}` : ''} × ${li.qty}\n    ${srcIcon} <code>${li.location}</code>${li.barcode ? ` · ${li.barcode}` : ''}`;
+  }).join('\n');
+
+  await sendTelegram(
+    `🛒 <b>Новый заказ ${newOrder.shopifyOrderName}</b>\n` +
+    `👤 ${newOrder.customer}\n` +
+    `📍 ${newOrder.address}\n\n` +
+    `${itemsText}\n\n` +
+    `💰 ${newOrder.total}\n` +
+    `🔗 Открыть склад: ${process.env.APP_URL || 'http://localhost:3000'}`
+  );
+
+  // Пишем в историю
+  addHistoryEvent({
+    type: 'order_created',
+    orderId: newOrder.id,
+    shopifyOrderName: newOrder.shopifyOrderName,
+    customer: newOrder.customer,
+    phone: newOrder.phone,
+    email: newOrder.email,
+    address: newOrder.address,
+    total: newOrder.total,
+    items: newOrder.lineItems.map(li => ({
+      title: li.title, size: li.size, qty: li.qty,
+      barcode: li.barcode || '', location: li.location, source: li.source
+    }))
+  });
+
+  console.log(`✅ Новый заказ: ${newOrder.shopifyOrderName}`);
+  res.status(200).send('OK');
+});
+
+// ── Вспомогательные функции ──
+function extractSize(item) {
+  // Ищем размер в вариантах (EU 38, size: 39, etc.)
+  const text = [item.variant_title, item.title, item.sku].join(' ');
+  const match = text.match(/\b(3[5-9]|4[0-2])\b/);
+  return match ? match[1] : '';
+}
+
+function formatAddress(addr) {
+  if (!addr) return '—';
+  return [addr.address1, addr.city, addr.country].filter(Boolean).join(', ');
+}
+
+// ════════════════════════════════════════
+// API: Получить заказы
+// ════════════════════════════════════════
+app.get('/api/orders', (req, res) => {
+  res.json(loadOrders());
+});
+
+// ── Исправить позицию в заказе ──
+app.post('/api/orders/:id/fix-line', (req, res) => {
+  const orders = loadOrders();
+  const order = orders.find(o => o.id === req.params.id);
+  if (!order) return res.status(404).json({ error: 'Not found' });
+  const { lineIdx, barcode, location } = req.body;
+  if (!order.lineItems || !order.lineItems[lineIdx]) return res.status(400).json({ error: 'Invalid lineIdx' });
+  if (barcode) order.lineItems[lineIdx].barcode = String(barcode);
+  if (location) order.lineItems[lineIdx].location = location;
+  saveOrders(orders);
+  res.json({ ok: true });
+});
+
+// ── Переотправить уведомление в Telegram ──
+app.post('/api/orders/:id/notify', async (req, res) => {
+  const orders = loadOrders();
+  const order = orders.find(o => o.id === req.params.id);
+  if (!order) return res.status(404).json({ error: 'Not found' });
+
+  const itemsText = (order.lineItems || []).map(li => {
+    const srcIcon = li.source === 'warehouse' ? '🏭' : li.source === 'shop' ? '🛍️' : '📦';
+    return `  • <b>${li.title}</b>${li.size ? ` EU${li.size}` : ''} × ${li.qty}\n    ${srcIcon} <code>${li.location}</code>${li.barcode ? ` · ${li.barcode}` : ''}`;
+  }).join('\n');
+
+  await sendTelegram(
+    `🛒 <b>${order.shopifyOrderName} (повтор)</b>\n` +
+    `👤 ${order.customer}\n` +
+    `📍 ${order.address}\n\n` +
+    `${itemsText}\n\n` +
+    `💰 ${order.total}`
+  );
+  res.json({ ok: true });
+});
+
+// ════════════════════════════════════════
+// API: Отгрузить заказ (списать остатки)
+// ════════════════════════════════════════
+app.post('/api/orders/:id/fulfill', async (req, res) => {
+  const orders = loadOrders();
+  const order = orders.find(o => o.id === req.params.id);
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+  // Разрешаем повторную обработку если нет fulfilledAt (заказ создан со статусом done но не обработан)
+  if (order.status === 'done' && order.fulfilledAt) return res.status(400).json({ error: 'Already fulfilled' });
+
+  const inv = loadInventory();
+  const shop = loadShopStock();
+  const results = [];
+  const source = order.source || 'shopify'; // 'manual'/'shopify' — для ручных смотрим source
+
+  for (const li of order.lineItems) {
+    const isShopSource = li.location && li.location.includes('Магазин') && !li.location.includes('Склад');
+
+    if (isShopSource) {
+      // Списываем из магазина — ищем по штрихкоду или по имени+размеру
+      console.log(`🔍 Ищем в магазине: barcode=${li.barcode} size=${li.size} title=${li.title}`);
+      console.log(`📦 Всего в shopstock: ${shop.length} позиций`);
+      const shopItem = shop.find(i => {
+        // Сначала по штрихкоду
+        if (li.barcode && String(i.barcode) === String(li.barcode)) return true;
+        return false;
+      });
+      if (shopItem && shopItem.shopQty >= li.qty) {
+        shopItem.shopQty -= li.qty;
+        results.push(`✅ ${li.title} EU${li.size} из магазина — списано ${li.qty} пар`);
+      } else if (shopItem) {
+        results.push(`⚠️ ${li.title} EU${li.size} — недостаточно в магазине (есть: ${shopItem.shopQty})`);
+      } else {
+        results.push(`⚠️ ${li.title} EU${li.size} — не найдено в магазине`);
+      }
+    } else {
+      // Списываем со склада
+      const item = inv.find(i =>
+        (String(i.barcode) === String(li.barcode)) ||
+        (i.name.toLowerCase().includes(li.title.split(' ')[0].toLowerCase()) &&
+         String(i.size) === String(li.size) &&
+         i.qty >= li.qty)
+      );
+      if (item) {
+        item.qty -= li.qty;
+        results.push(`✅ ${li.title} EU${li.size} с ${item.location} — списано ${li.qty} пар`);
+      } else {
+        results.push(`⚠️ ${li.title} EU${li.size} — не найдено на складе`);
+      }
+    }
+  }
+
+  order.status = 'done';
+  order.fulfilledAt = new Date().toISOString();
+  saveOrders(orders);
+  saveInventory(inv);
+  saveShopStockData(shop);
+
+  // Пишем в историю
+  addHistoryEvent({
+    type: 'order_fulfilled',
+    orderId: order.id,
+    shopifyOrderName: order.shopifyOrderName,
+    customer: order.customer,
+    fulfilledAt: order.fulfilledAt,
+    results,
+    items: order.lineItems.map(li => ({
+      title: li.title, size: li.size, qty: li.qty, location: li.location
+    }))
+  });
+
+  // Уведомление в Telegram
+  await sendTelegram(
+    `✅ <b>Заказ ${order.shopifyOrderName} отгружен</b>\n\n` +
+    results.join('\n')
+  );
+
+  res.json({ ok: true, results });
+});
+
+// ════════════════════════════════════════
+// API: Инвентарь (чтение и запись)
+// ════════════════════════════════════════
+// ── Версия инвентаря (защита от затирания при работе с нескольких устройств) ──
+const INV_VERSION_FILE = path.join(DATA_DIR, 'inventory_version.json');
+function loadInvVersion() {
+  try { return JSON.parse(fs.readFileSync(INV_VERSION_FILE, 'utf8')).v || 0; } catch { return 0; }
+}
+function saveInvVersion(v) {
+  fs.writeFileSync(INV_VERSION_FILE, JSON.stringify({ v, ts: new Date().toISOString() }));
+}
+function bumpInvVersion() {
+  const v = loadInvVersion() + 1;
+  saveInvVersion(v);
+  return v;
+}
+
+app.get('/api/inventory', (req, res) => {
+  res.json(loadInventory());
+});
+
+// Инвентарь + версия одним запросом
+app.get('/api/inventory/versioned', (req, res) => {
+  res.json({ version: loadInvVersion(), inventory: loadInventory() });
+});
+
+// Патч штрихкодов в shopstock по name+material+color+size
+app.post('/api/shopstock/patch-barcodes', (req, res) => {
+  const { updates } = req.body;
+  if (!updates || !Array.isArray(updates)) return res.status(400).json({ error: 'updates required' });
+  const shop = loadShopStock();
+  const results = [];
+  updates.forEach(u => {
+    const item = shop.find(i =>
+      i.name === u.name &&
+      (i.material||'') === (u.material||'') &&
+      i.color === u.color &&
+      String(i.size||'') === String(u.size||'')
+    );
+    if (item) {
+      const old = item.barcode;
+      item.barcode = u.barcode;
+      results.push(`✅ ${u.name} ${u.color} EU${u.size}: ${old} → ${u.barcode}`);
+    } else {
+      results.push(`⚠️ Не найдено: ${u.name} ${u.color} EU${u.size}`);
+    }
+  });
+  saveShopStockData(shop);
+  res.json({ ok: true, results });
+});
+
+// Патч штрихкодов в inventory по name+material+color+size
+app.post('/api/inventory/patch-barcodes', (req, res) => {
+  const { updates } = req.body;
+  if (!updates || !Array.isArray(updates)) return res.status(400).json({ error: 'updates required' });
+  const inv = loadInventory();
+  const results = [];
+  updates.forEach(u => {
+    const items = inv.filter(i =>
+      i.name === u.name &&
+      (i.material||'') === (u.material||'') &&
+      i.color === u.color &&
+      String(i.size||'') === String(u.size||'')
+    );
+    if (items.length > 0) {
+      items.forEach(i => { i.barcode = u.barcode; });
+      results.push(`✅ ${u.name} ${u.color} EU${u.size} (${items.length} ячеек): → ${u.barcode}`);
+    } else {
+      results.push(`⚠️ Не найдено: ${u.name} ${u.color} EU${u.size}`);
+    }
+  });
+  saveInventory(inv);
+  res.json({ ok: true, results });
+});
+
+// Патч конкретной позиции по id
+app.post('/api/inventory/patch', (req, res) => {
+  const { id, qty } = req.body;
+  if (!id || qty === undefined) return res.status(400).json({ error: 'id and qty required' });
+  const inv = loadInventory();
+  const item = inv.find(i => i.id === id);
+  if (!item) return res.status(404).json({ error: 'Not found' });
+  const oldQty = item.qty;
+  item.qty = qty;
+  saveInventory(inv);
+  res.json({ ok: true, id, oldQty, newQty: qty, name: item.name, color: item.color, size: item.size });
+});
+
+app.post('/api/inventory', (req, res) => {
+  // Поддерживаем два формата:
+  //  старый: [items]  — без проверки версии (для совместимости)
+  //  новый:  { baseVersion, inventory } — с optimistic locking
+  const body = req.body;
+
+  if (Array.isArray(body)) {
+    // Старый клиент — сохраняем как раньше, но версию всё равно двигаем
+    saveInventory(body);
+    const v = bumpInvVersion();
+    return res.json({ ok: true, count: body.length, version: v });
+  }
+
+  const { baseVersion, inventory: inv } = body || {};
+  if (!Array.isArray(inv)) return res.status(400).json({ error: 'Expected array' });
+
+  const serverVersion = loadInvVersion();
+  if (typeof baseVersion === 'number' && baseVersion !== serverVersion) {
+    // Клиент отталкивался от устаревших данных — отклоняем, отдаём свежие
+    console.log(`🛡️ Инвентарь: конфликт версий (клиент ${baseVersion}, сервер ${serverVersion}) — сохранение отклонено`);
+    return res.status(409).json({
+      ok: false,
+      error: 'version_conflict',
+      version: serverVersion,
+      inventory: loadInventory()
+    });
+  }
+
+  saveInventory(inv);
+  const v = bumpInvVersion();
+  res.json({ ok: true, count: inv.length, version: v });
+});
+
+// ════════════════════════════════════════
+// API: Удалить заказ
+// ════════════════════════════════════════
+app.delete('/api/orders/:id', (req, res) => {
+  const orders = loadOrders();
+  const filtered = orders.filter(o => o.id !== req.params.id);
+  if (filtered.length === orders.length) return res.status(404).json({ error: 'Not found' });
+  saveOrders(filtered);
+  console.log(`🗑 Заказ удалён: ${req.params.id}`);
+  res.json({ ok: true });
+});
+
+// ════════════════════════════════════════
+// ИСТОРИЯ СОБЫТИЙ (аналитика)
+// ════════════════════════════════════════
+const HISTORY_FILE = path.join(DATA_DIR, 'history.json');
+
+function loadHistory() {
+  try { return JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8')); } catch { return []; }
+}
+function saveHistory(data) {
+  fs.writeFileSync(HISTORY_FILE, JSON.stringify(data, null, 2));
+}
+function addHistoryEvent(event) {
+  const history = loadHistory();
+  history.push({
+    ...event,
+    ts: new Date().toISOString()
+  });
+  saveHistory(history);
+}
+
+// Получить историю (с фильтрами)
+app.get('/api/history', (req, res) => {
+  let history = loadHistory();
+  const { type, from, to, limit } = req.query;
+  if (type) history = history.filter(e => e.type === type);
+  if (from) history = history.filter(e => e.ts >= from);
+  if (to)   history = history.filter(e => e.ts <= to);
+  history = history.sort((a, b) => b.ts.localeCompare(a.ts));
+  if (limit) history = history.slice(0, parseInt(limit));
+  res.json(history);
+});
+
+// Записать событие в историю
+app.post('/api/history', (req, res) => {
+  const event = req.body;
+  if (!event || !event.type) return res.status(400).json({ error: 'Missing type' });
+  addHistoryEvent(event);
+  res.json({ ok: true });
+});
+
+// ════════════════════════════════════════
+// API: Магазин (shopstock)
+// ════════════════════════════════════════
+const SHOPSTOCK_FILE2 = path.join(DATA_DIR, 'shopstock.json');
+
+app.get('/api/shopstock', (req, res) => {
+  try { res.json(JSON.parse(fs.readFileSync(SHOPSTOCK_FILE2, 'utf8'))); }
+  catch { res.json([]); }
+});
+
+app.post('/api/shopstock', (req, res) => {
+  const data = req.body;
+  if (!Array.isArray(data)) return res.status(400).json({ error: 'Expected array' });
+  fs.writeFileSync(SHOPSTOCK_FILE2, JSON.stringify(data, null, 2));
+  res.json({ ok: true, count: data.length });
+});
+
+// ════════════════════════════════════════
+// API: Синхронизация заказов (полная запись)
+// ════════════════════════════════════════
+app.post('/api/orders/sync', (req, res) => {
+  const data = req.body;
+  if (!Array.isArray(data)) return res.status(400).json({ error: 'Expected array' });
+
+  // МЕРДЖ вместо перезаписи: защищаем свежие вебхук-заказы от затирания
+  // старым списком из браузера (гонка: заказ пришёл на сервер, а браузер
+  // ещё его не видел и отправил свой список без него)
+  const current = loadOrders();
+  const sentIds = new Set(data.map(o => String(o.id)));
+  const tenMinAgo = Date.now() - 10 * 60 * 1000;
+
+  const preserved = current.filter(o => {
+    if (sentIds.has(String(o.id))) return false; // есть в присланном — берём версию браузера
+    if (!o.shopifyId) return false; // не вебхук-заказ (ручной/продажа) — браузер главный, удаление законно
+    const createdAt = o.createdAt ? new Date(o.createdAt).getTime() : 0;
+    return createdAt > tenMinAgo; // свежий вебхук-заказ, браузер его ещё не видел — сохраняем
+  });
+
+  if (preserved.length > 0) {
+    console.log(`🛡️ Защищено от затирания ${preserved.length} свежих вебхук-заказов`);
+  }
+
+  const merged = [...preserved, ...data];
+  saveOrders(merged);
+  res.json({ ok: true, count: merged.length, preserved: preserved.length });
+});
+
+// ════════════════════════════════════════
+// SHOPIFY OAUTH
+// ════════════════════════════════════════
+const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID || '';
+const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET || '';
+const SHOPIFY_SCOPES = 'read_products,write_products,read_inventory,write_inventory';
+const APP_URL = process.env.APP_URL || 'https://alagio-warehouse-production.up.railway.app';
+
+// Шаг 1: Редирект на Shopify для авторизации
+app.get('/auth/shopify', (req, res) => {
+  const shop = req.query.shop || 'alagio-2.myshopify.com';
+  const redirectUri = `${APP_URL}/auth/shopify/callback`;
+  const installUrl = `https://${shop}/admin/oauth/authorize?client_id=${SHOPIFY_CLIENT_ID}&scope=${SHOPIFY_SCOPES}&redirect_uri=${redirectUri}`;
+  res.redirect(installUrl);
+});
+
+// Шаг 2: Callback — получаем токен
+app.get('/auth/shopify/callback', async (req, res) => {
+  const { shop, code } = req.query;
+  if (!shop || !code) return res.status(400).send('Missing shop or code');
+
+  try {
+    const tokenRes = await fetch(`https://${shop}/admin/oauth/access_token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_id: SHOPIFY_CLIENT_ID,
+        client_secret: SHOPIFY_CLIENT_SECRET,
+        code
+      })
+    });
+    const data = await tokenRes.json();
+    const token = data.access_token;
+
+    if (!token) return res.status(400).send('Failed to get token: ' + JSON.stringify(data));
+
+    // Сохраняем токен
+    const tokenFile = path.join(DATA_DIR, 'shopify_token.json');
+    fs.writeFileSync(tokenFile, JSON.stringify({ shop, token }, null, 2));
+    console.log(`✅ Shopify токен получен для ${shop}`);
+
+    res.send(`<h2>✅ Успешно!</h2><p>Токен для ${shop} сохранён.</p><p>Теперь можно закрыть эту страницу.</p>`);
+  } catch(e) {
+    res.status(500).send('Error: ' + e.message);
+  }
+});
+
+// Получить сохранённый токен
+function loadShopifyToken() {
+  try {
+    const data = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'shopify_token.json'), 'utf8'));
+    return data;
+  } catch { return null; }
+}
+
+// Проверить токен
+app.get('/auth/shopify/token', (req, res) => {
+  const data = loadShopifyToken();
+  if (!data) return res.json({ ok: false, message: 'Токен не найден' });
+  res.json({ ok: true, shop: data.shop, token: data.token.substring(0, 8) + '...' });
+});
+
+// ════════════════════════════════════════
+// SHOPIFY INVENTORY SYNC
+// ════════════════════════════════════════
+
+// Посмотреть локации магазина
+app.get('/api/shopify/locations', async (req, res) => {
+  const tokenData = loadShopifyToken();
+  if (!tokenData) return res.status(400).json({ error: 'Не авторизован' });
+  const { shop, token } = tokenData;
+  const r = await fetch(`https://${shop}/admin/api/2024-04/locations.json`, {
+    headers: { 'X-Shopify-Access-Token': token }
+  });
+  res.json(await r.json());
+});
+
+// Тест синхронизации одного штрихкода
+app.get('/api/shopify/sync-one', async (req, res) => {
+  const tokenData = loadShopifyToken();
+  if (!tokenData) return res.status(400).json({ error: 'Shopify не авторизован' });
+
+  const { barcode } = req.query;
+  if (!barcode) return res.status(400).json({ error: 'Укажите ?barcode=...' });
+
+  const { shop, token } = tokenData;
+  const headers = { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' };
+
+  try {
+    // Ищем вариант по штрихкоду — перебираем страницы если нужно
+    let variants = [];
+    let page_info = null;
+    do {
+      const url = page_info
+        ? `https://${shop}/admin/api/2024-04/variants.json?limit=250&page_info=${page_info}`
+        : `https://${shop}/admin/api/2024-04/variants.json?barcode=${barcode}&limit=250`;
+      const searchRes = await fetch(url, { headers });
+      const searchData = await searchRes.json();
+      variants = variants.concat(searchData.variants || []);
+      // Проверяем Link header для пагинации
+      const link = searchRes.headers.get('Link') || '';
+      const nextMatch = link.match(/<[^>]*page_info=([^>&]+)[^>]*>;\s*rel="next"/);
+      page_info = nextMatch ? nextMatch[1] : null;
+    } while (page_info && variants.length < 500);
+
+    // Фильтруем по штрихкоду (на случай если API вернул лишнее)
+    const matched = variants.filter(v => v.barcode === barcode);
+
+    if (!matched.length) {
+      // Попробуем через GraphQL поиск
+      return res.json({ ok: false, message: `Штрихкод ${barcode} не найден в Shopify` });
+    }
+
+    // Берём первый найденный вариант
+    const variant = matched[0];
+
+    // Получаем location
+    const locRes = await fetch(`https://${shop}/admin/api/2024-04/locations.json`, { headers });
+    const locData = await locRes.json();
+    const locationId = locData.locations?.[0]?.id;
+
+    // Текущий остаток
+    const invRes = await fetch(
+      `https://${shop}/admin/api/2024-04/inventory_levels.json?inventory_item_ids=${variant.inventory_item_id}&location_ids=${locationId}`,
+      { headers }
+    );
+    const invData = await invRes.json();
+    const currentQty = invData.inventory_levels?.[0]?.available ?? '?';
+
+    // Считаем сводные остатки (склад + магазин)
+    const inv = loadInventory();
+    const shopStockData = loadShopStock();
+    const warehouseQty = inv.filter(i => String(i.barcode) === String(barcode)).reduce((s, i) => s + i.qty, 0);
+    const shopQty = shopStockData.filter(i => String(i.barcode) === String(barcode)).reduce((s, i) => s + (i.shopQty||0), 0);
+    const newQty = warehouseQty + shopQty;
+
+    res.json({
+      ok: true,
+      barcode,
+      variantTitle: variant.title,
+      productId: variant.product_id,
+      currentQtyShopify: currentQty,
+      newQtyWarehouse: newQty,
+      warehouseQty,
+      shopQty,
+      willChange: currentQty !== newQty,
+      message: `Текущий остаток в Shopify: ${currentQty} → Новый: ${newQty} (склад: ${warehouseQty} + магазин: ${shopQty})`
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Применить синхронизацию одного штрихкода
+app.get('/api/shopify/sync-one/apply', async (req, res) => {
+  const tokenData = loadShopifyToken();
+  if (!tokenData) return res.status(400).json({ error: 'Shopify не авторизован' });
+
+  const { barcode } = req.query;
+  if (!barcode) return res.status(400).json({ error: 'Укажите ?barcode=...' });
+
+  const { shop, token } = tokenData;
+  const headers = { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' };
+
+  try {
+    let allVariants = [];
+    let pi = null;
+    do {
+      const url = pi
+        ? `https://${shop}/admin/api/2024-04/variants.json?limit=250&page_info=${pi}`
+        : `https://${shop}/admin/api/2024-04/variants.json?barcode=${barcode}&limit=250`;
+      const sr = await fetch(url, { headers });
+      const sd = await sr.json();
+      allVariants = allVariants.concat(sd.variants || []);
+      const lnk = sr.headers.get('Link') || '';
+      const nm = lnk.match(/<[^>]*page_info=([^>&]+)[^>]*>;\s*rel="next"/);
+      pi = nm ? nm[1] : null;
+    } while (pi && allVariants.length < 500);
+
+    const matched = allVariants.filter(v => v.barcode === barcode);
+    if (!matched.length) return res.json({ ok: false, message: 'Не найден в Shopify' });
+
+    const variant = matched[0];
+    const locRes = await fetch(`https://${shop}/admin/api/2024-04/locations.json`, { headers });
+    const locationId = (await locRes.json()).locations?.[0]?.id;
+
+    const inv = loadInventory();
+    const shopStockData = loadShopStock();
+    const warehouseQty = inv.filter(i => String(i.barcode) === String(barcode)).reduce((s, i) => s + i.qty, 0);
+    const shopQty = shopStockData.filter(i => String(i.barcode) === String(barcode)).reduce((s, i) => s + (i.shopQty||0), 0);
+    const newQty = warehouseQty + shopQty;
+
+    const setRes = await fetch(`https://${shop}/admin/api/2024-04/inventory_levels/set.json`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ location_id: locationId, inventory_item_id: variant.inventory_item_id, available: newQty })
+    });
+    const setData = await setRes.json();
+
+    if (setData.inventory_level) {
+      res.json({ ok: true, barcode, newQty, message: `✅ Обновлено! Остаток: ${newQty}` });
+    } else {
+      res.json({ ok: false, error: setData });
+    }
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Проверить штрихкоды — что найдётся в Shopify (без изменений)
+app.get('/api/shopify/check', async (req, res) => {
+  const tokenData = loadShopifyToken();
+  if (!tokenData) return res.status(400).json({ error: 'Shopify не авторизован' });
+
+  const { shop, token } = tokenData;
+  const headers = { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' };
+
+  // Берём все штрихкоды из инвентаря
+  const inv = loadInventory();
+  const barcodeQty = {};
+  inv.forEach(item => {
+    if (item.barcode && item.qty > 0) {
+      barcodeQty[item.barcode] = (barcodeQty[item.barcode] || 0) + item.qty;
+    }
+  });
+
+  const results = [];
+  let found = 0, notFound = 0;
+
+  for (const [barcode, qty] of Object.entries(barcodeQty)) {
+    try {
+      const searchRes = await fetch(
+        `https://${shop}/admin/api/2024-04/variants.json?barcode=${barcode}&limit=1`,
+        { headers }
+      );
+      const searchData = await searchRes.json();
+      const variant = searchData.variants?.[0];
+
+      if (variant) {
+        // Получаем текущий остаток
+        const invRes = await fetch(
+          `https://${shop}/admin/api/2024-04/inventory_levels.json?inventory_item_ids=${variant.inventory_item_id}`,
+          { headers }
+        );
+        const invData = await invRes.json();
+        const currentQty = invData.inventory_levels?.[0]?.available ?? '?';
+
+        results.push({
+          barcode,
+          productTitle: variant.title,
+          currentQtyShopify: currentQty,
+          newQtyWarehouse: qty,
+          willChange: currentQty !== qty
+        });
+        found++;
+      } else {
+        results.push({ barcode, status: 'NOT FOUND IN SHOPIFY', newQtyWarehouse: qty });
+        notFound++;
+      }
+    } catch(e) {
+      results.push({ barcode, status: 'ERROR', detail: e.message });
+    }
+  }
+
+  res.json({
+    summary: { total: Object.keys(barcodeQty).length, found, notFound },
+    results
+  });
+});
+
+// Синхронизировать остатки в Shopify по штрихкоду
+app.post('/api/shopify/sync', async (req, res) => {
+  const tokenData = loadShopifyToken();
+  if (!tokenData) return res.status(400).json({ error: 'Shopify не авторизован. Пройдите /auth/shopify' });
+
+  const { shop, token } = tokenData;
+  const { items } = req.body; // [{ barcode, qty }]
+
+  if (!items || !items.length) return res.status(400).json({ error: 'No items' });
+
+  const headers = {
+    'X-Shopify-Access-Token': token,
+    'Content-Type': 'application/json'
+  };
+
+  const results = [];
+  let synced = 0, errors = 0;
+
+  // Получаем location_id один раз
+  const locRes = await fetch(`https://${shop}/admin/api/2024-04/locations.json`, { headers });
+  const locData = await locRes.json();
+  const locationId = locData.locations?.[0]?.id;
+  if (!locationId) return res.status(400).json({ error: 'No location found' });
+
+  // Задержка между запросами чтобы не словить throttling
+  const delay = ms => new Promise(r => setTimeout(r, ms));
+
+  for (const item of items) {
+    try {
+      // Ищем вариант по штрихкоду — с retry при 429
+      let allVariants = [];
+      let pi = null;
+      do {
+        const url = pi
+          ? `https://${shop}/admin/api/2024-04/variants.json?limit=250&page_info=${pi}`
+          : `https://${shop}/admin/api/2024-04/variants.json?barcode=${item.barcode}&limit=250`;
+        let sr = await fetch(url, { headers });
+        if (sr.status === 429) {
+          const retryAfter = parseFloat(sr.headers.get('Retry-After') || '2');
+          console.log(`⏳ Rate limit — ждём ${retryAfter}с`);
+          await delay(retryAfter * 1000 + 500);
+          sr = await fetch(url, { headers }); // повтор
+        }
+        if (sr.status === 429) { errors++; results.push({ barcode: item.barcode, status: 'throttled' }); break; }
+        const sd = await sr.json();
+        allVariants = allVariants.concat(sd.variants || []);
+        const lnk = sr.headers.get('Link') || '';
+        const nm = lnk.match(/page_info=([^>&"]+)[^>]*>;\s*rel="next"/);
+        pi = nm ? nm[1] : null;
+      } while (pi && allVariants.length < 500);
+
+      const matched = allVariants.filter(v => String(v.barcode) === String(item.barcode));
+      const variant = matched[0];
+
+      if (!variant) {
+        results.push({ barcode: item.barcode, status: 'not_found' });
+        errors++;
+        await delay(100);
+        continue;
+      }
+
+      // Обновляем количество
+      const setRes = await fetch(`https://${shop}/admin/api/2024-04/inventory_levels/set.json`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          location_id: locationId,
+          inventory_item_id: variant.inventory_item_id,
+          available: item.qty
+        })
+      });
+
+      if (setRes.status === 429) {
+        const retryAfter = parseFloat(setRes.headers.get('Retry-After') || '2');
+        console.log(`⏳ Rate limit на set — ждём ${retryAfter}с`);
+        await delay(retryAfter * 1000 + 500);
+        // Повторная попытка
+        const setRes2 = await fetch(`https://${shop}/admin/api/2024-04/inventory_levels/set.json`, {
+          method: 'POST', headers,
+          body: JSON.stringify({ location_id: locationId, inventory_item_id: variant.inventory_item_id, available: item.qty })
+        });
+        if (setRes2.ok) { synced++; results.push({ barcode: item.barcode, qty: item.qty, status: 'ok' }); continue; }
+        errors++;
+        results.push({ barcode: item.barcode, status: 'throttled' });
+        continue;
+      }
+
+      const setData = await setRes.json();
+      if (setData.inventory_level) {
+        results.push({ barcode: item.barcode, qty: item.qty, status: 'ok' });
+        synced++;
+      } else {
+        results.push({ barcode: item.barcode, status: 'error', detail: JSON.stringify(setData) });
+        errors++;
+      }
+
+      // Пауза между запросами — 600ms чтобы не превышать 2 req/sec лимит Shopify
+      await delay(600);
+
+    } catch(e) {
+      results.push({ barcode: item.barcode, status: 'exception', detail: e.message });
+      errors++;
+    }
+  }
+
+  // Сохраняем успешно синхронизированные значения как "последние отправленные"
+  const qtyUpdate = {};
+  results.filter(r => r.status === 'ok').forEach(r => {
+    qtyUpdate[r.barcode] = r.qty;
+  });
+  if (Object.keys(qtyUpdate).length > 0) {
+    const current = loadQty();
+    Object.assign(current, qtyUpdate);
+    saveQty(current);
+  }
+
+  console.log(`📦 Shopify sync: ${synced} обновлено, ${errors} ошибок`);
+  res.json({ ok: true, synced, errors, results });
+});
+
+// Debug: сколько вариантов с этим штрихкодом
+app.get('/api/shopify/debug-barcode', async (req, res) => {
+  const tokenData = loadShopifyToken();
+  if (!tokenData) return res.status(400).json({ error: 'Не авторизован' });
+  const { shop, token } = tokenData;
+  const { barcode } = req.query;
+  const headers = { 'X-Shopify-Access-Token': token };
+  
+  let allVariants = [];
+  let pi = null;
+  do {
+    const url = pi
+      ? `https://${shop}/admin/api/2024-04/variants.json?limit=250&page_info=${pi}`
+      : `https://${shop}/admin/api/2024-04/variants.json?barcode=${barcode}&limit=250`;
+    const sr = await fetch(url, { headers });
+    const sd = await sr.json();
+    allVariants = allVariants.concat(sd.variants || []);
+    const lnk = sr.headers.get('Link') || '';
+    const nm = lnk.match(/page_info=([^>&"]+)[^>]*>; rel="next"/);
+    pi = nm ? nm[1] : null;
+  } while (pi && allVariants.length < 500);
+
+  const matched = allVariants.filter(v => String(v.barcode) === String(barcode));
+  
+  // Для каждого получаем текущий остаток
+  const locRes = await fetch(`https://${shop}/admin/api/2024-04/locations.json`, { headers });
+  const locationId = (await locRes.json()).locations?.[0]?.id;
+  
+  const details = await Promise.all(matched.map(async v => {
+    const invRes = await fetch(`https://${shop}/admin/api/2024-04/inventory_levels.json?inventory_item_ids=${v.inventory_item_id}&location_ids=${locationId}`, { headers });
+    const invData = await invRes.json();
+    return {
+      variantId: v.id,
+      productId: v.product_id,
+      title: v.title,
+      inventoryItemId: v.inventory_item_id,
+      available: invData.inventory_levels?.[0]?.available ?? '?'
+    };
+  }));
+  
+  res.json({ barcode, found: matched.length, details });
+});
+
+// ── PWA файлы ──
+app.get('/manifest.json', (req, res) => {
+  res.sendFile(path.join(__dirname, 'manifest.json'));
+});
+app.get('/sw.js', (req, res) => {
+  res.setHeader('Service-Worker-Allowed', '/');
+  res.sendFile(path.join(__dirname, 'sw.js'));
+});
+app.get('/icon-192.png', (req, res) => {
+  res.sendFile(path.join(__dirname, 'icon-192.png'));
+});
+app.get('/icon-512.png', (req, res) => {
+  res.sendFile(path.join(__dirname, 'icon-512.png'));
+});
+
+// ════════════════════════════════════════
+// API: Прайс-лист
+// ════════════════════════════════════════
+app.get('/api/pricelist', (req, res) => {
+  res.json(loadPriceList());
+});
+
+// Полная замена прайса
+app.post('/api/pricelist/full', (req, res) => {
+  const { prices } = req.body || {};
+  if (!prices || typeof prices !== 'object') return res.status(400).json({ error: 'prices required' });
+  savePriceList(prices);
+  res.json({ ok: true, count: Object.keys(prices).length });
+});
+
+// Обновить только присланные позиции
+app.post('/api/pricelist/merge', (req, res) => {
+  const { prices } = req.body || {};
+  if (!prices || typeof prices !== 'object') return res.status(400).json({ error: 'prices required' });
+  const current = loadPriceList();
+  const merged = { ...current, ...prices };
+  savePriceList(merged);
+  res.json({ ok: true, count: Object.keys(merged).length });
+});
+
+// Очистить прайс
+app.delete('/api/pricelist', (req, res) => {
+  savePriceList({});
+  res.json({ ok: true });
+});
+
+// ── Health check ──
+app.get('/health', (req, res) => {
+  res.json({ ok: true, orders: loadOrders().length, inventory: loadInventory().length, prices: Object.keys(loadPriceList()).length });
+});
+
+// ── Telegram proxy endpoint ──
+app.post('/api/telegram', async (req, res) => {
+  const { text } = req.body;
+  if (!text) return res.status(400).json({ error: 'No text' });
+  await sendTelegram(text);
+  res.json({ ok: true });
+});
+
+// ════════════════════════════════════════
+// API: Штрихкоды
+// ════════════════════════════════════════
+const BARCODES_FILE = path.join(DATA_DIR, 'barcodes.json');
+function loadBarcodes() {
+  try { return JSON.parse(fs.readFileSync(BARCODES_FILE, 'utf8')); } catch { return {}; }
+}
+function saveBarcodes(data) {
+  fs.writeFileSync(BARCODES_FILE, JSON.stringify(data, null, 2));
+}
+
+app.get('/api/barcodes', (req, res) => {
+  res.json(loadBarcodes());
+});
+
+app.post('/api/barcodes', (req, res) => {
+  const data = req.body;
+  if (typeof data !== 'object') return res.status(400).json({ error: 'Expected object' });
+  saveBarcodes(data);
+  res.json({ ok: true });
+});
+
+// ════════════════════════════════════════
+// API: Перемещения
+// ════════════════════════════════════════
+const TRANSFERS_FILE = path.join(DATA_DIR, 'transfers.json');
+function loadTransfersData() {
+  try { return JSON.parse(fs.readFileSync(TRANSFERS_FILE, 'utf8')); }
+  catch { return { transferOrders: [], transitItems: [] }; }
+}
+function saveTransfersData(data) {
+  fs.writeFileSync(TRANSFERS_FILE, JSON.stringify(data, null, 2));
+}
+
+app.get('/api/transfers', (req, res) => {
+  res.json(loadTransfersData());
+});
+
+app.post('/api/transfers', (req, res) => {
+  const { transferOrders, transitItems } = req.body;
+  if (!transferOrders || !transitItems) return res.status(400).json({ error: 'Invalid data' });
+  saveTransfersData({ transferOrders, transitItems });
+  res.json({ ok: true });
+});
+
+// ════════════════════════════════════════
+// API: Остатки по qty (только количество)
+// ════════════════════════════════════════
+const QTY_FILE = path.join(DATA_DIR, 'qty.json');
+function loadQty() {
+  try { return JSON.parse(fs.readFileSync(QTY_FILE, 'utf8')); } catch { return {}; }
+}
+function saveQty(data) {
+  fs.writeFileSync(QTY_FILE, JSON.stringify(data, null, 2));
+}
+
+app.get('/api/qty', (req, res) => {
+  res.json(loadQty());
+});
+
+app.post('/api/qty', (req, res) => {
+  const data = req.body;
+  if (typeof data !== 'object' || Array.isArray(data)) return res.status(400).json({ error: 'Expected object' });
+  const current = loadQty();
+  Object.assign(current, data);
+  saveQty(current);
+  res.json({ ok: true });
+});
+
+// ════════════════════════════════════════
+// ФОТО МОДЕЛЕЙ
+// ════════════════════════════════════════
+const PHOTOS_DIR = path.join(DATA_DIR, 'photos');
+if (!fs.existsSync(PHOTOS_DIR)) fs.mkdirSync(PHOTOS_DIR, { recursive: true });
+if (!fs.existsSync(PHOTOS_DIR)) fs.mkdirSync(PHOTOS_DIR);
+
+// Отдаём фото
+app.use('/photos', express.static(PHOTOS_DIR));
+
+// Загрузка фото (multipart/form-data)
+app.post('/api/photos/:model', (req, res) => {
+  const model = req.params.model.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+  const chunks = [];
+  let contentType = 'image/jpeg';
+
+  req.on('data', chunk => chunks.push(chunk));
+  req.on('end', () => {
+    const body = Buffer.concat(chunks);
+    // Определяем расширение по Content-Type заголовку
+    const ct = req.headers['content-type'] || '';
+    const ext = ct.includes('png') ? 'png' : ct.includes('webp') ? 'webp' : 'jpg';
+    const filename = `${model}.${ext}`;
+    const filepath = path.join(PHOTOS_DIR, filename);
+
+    // Удаляем старые версии этой модели
+    ['jpg','jpeg','png','webp'].forEach(e => {
+      const old = path.join(PHOTOS_DIR, `${model}.${e}`);
+      if (fs.existsSync(old)) fs.unlinkSync(old);
+    });
+
+    fs.writeFileSync(filepath, body);
+    console.log(`📸 Фото загружено: ${filename}`);
+    res.json({ ok: true, url: `/photos/${filename}` });
+  });
+});
+
+// Список загруженных фото
+app.get('/api/photos', (req, res) => {
+  try {
+    const files = fs.readdirSync(PHOTOS_DIR)
+      .filter(f => /\.(jpg|jpeg|png|webp)$/i.test(f))
+      .map(f => ({ model: f.replace(/\.[^.]+$/, ''), url: `/photos/${f}` }));
+    res.json(files);
+  } catch { res.json([]); }
+});
+
+// Удалить фото модели
+app.delete('/api/photos/:model', (req, res) => {
+  const model = req.params.model.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+  let deleted = false;
+  ['jpg','jpeg','png','webp'].forEach(e => {
+    const f = path.join(PHOTOS_DIR, `${model}.${e}`);
+    if (fs.existsSync(f)) { fs.unlinkSync(f); deleted = true; }
+  });
+  res.json({ ok: deleted });
+});
+
+app.listen(PORT, () => {
+  console.log(`🚀 AlagioStore сервер запущен на порту ${PORT}`);
+});
